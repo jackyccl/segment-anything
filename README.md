@@ -10,5 +10,4 @@ Language Segment-Anything is an open-source project that uses text prompts and i
 - Customizable text prompts for object detection (using GroundingDINO) and segmentation (using SAM from Meta AI).
 
 ## Getting Started
-Go to demo! [![HuggingFace space](https://img.shields.io/badge/🤗-HuggingFace%20Space-cyan.svg)](https://huggingface.co/spaces/ShilongLiu/Grounding_DINO_demo)
-
+Go to demo! [![HuggingFace space](https://img.shields.io/badge/🤗-HuggingFace%20Space-yellow.svg)](https://huggingface.co/spaces/jackyccl/segment-anything)
