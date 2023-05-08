@@ -5,6 +5,7 @@ Language Segment-Anything is an open-source project that uses text prompts and i
 ## New Features!
 
 - Add Stable diffusion inpainting.
+- Add Lama-cleaner as remove function.
 
 ## Features
 
