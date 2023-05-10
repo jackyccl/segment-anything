@@ -11,6 +11,8 @@ import subprocess
 import copy
 import time
 import warnings
+import io
+import random
 
 import torch
 from torchvision.ops import box_convert
@@ -26,13 +28,18 @@ import groundingdino.datasets.transforms as T
 # segment anything
 from segment_anything import build_sam, SamPredictor 
 
+# lama-cleaner
+from lama_cleaner.model_manager import ModelManager
+from lama_cleaner.schema import Config as lama_Config
+from lama_cleaner.helper import load_img, numpy_to_bytes, resize_max_size
+
 #stable diffusion
 from diffusers import StableDiffusionInpaintPipeline
 
 from huggingface_hub import hf_hub_download
 
-if not os.path.exists('./demo1.jpg'):
-    os.system("wget https://github.com/IDEA-Research/Grounded-Segment-Anything/raw/main/assets/demo1.jpg")
+if not os.path.exists('./inpaint_demo.jpg'):
+    os.system("wget https://github.com/IDEA-Research/Grounded-Segment-Anything/raw/main/assets/inpaint_demo.jpg")
 
 if not os.path.exists('./sam_vit_h_4b8939.pth'):
     logger.info(f"get sam_vit_h_4b8939.pth...")
@@ -177,6 +184,104 @@ def mix_masks(imgs):
     re_img =  1 - re_img
     return  Image.fromarray(np.uint8(255*re_img))
 
+def lama_cleaner_process(image, mask):
+    ori_image = image
+    if mask.shape[0] == image.shape[1] and mask.shape[1] == image.shape[0] and mask.shape[0] != mask.shape[1]:
+        # rotate image
+        ori_image = np.transpose(image[::-1, ...][:, ::-1], axes=(1, 0, 2))[::-1, ...]
+        image = ori_image
+    
+    original_shape = ori_image.shape
+    interpolation = cv2.INTER_CUBIC
+    
+    size_limit = 1080
+    if size_limit == "Original":
+        size_limit = max(image.shape)
+    else:
+        size_limit = int(size_limit)
+
+    config = lama_Config(
+        ldm_steps=25,
+        ldm_sampler='plms',
+        zits_wireframe=True,
+        hd_strategy='Original',
+        hd_strategy_crop_margin=196,
+        hd_strategy_crop_trigger_size=1280,
+        hd_strategy_resize_limit=2048,
+        prompt='',
+        use_croper=False,
+        croper_x=0,
+        croper_y=0,
+        croper_height=512,
+        croper_width=512,
+        sd_mask_blur=5,
+        sd_strength=0.75,
+        sd_steps=50,
+        sd_guidance_scale=7.5,
+        sd_sampler='ddim',
+        sd_seed=42,
+        cv2_flag='INPAINT_NS',
+        cv2_radius=5,
+    )
+    
+    if config.sd_seed == -1:
+        config.sd_seed = random.randint(1, 999999999)
+
+    # logger.info(f"Origin image shape_0_: {original_shape} / {size_limit}")
+    image = resize_max_size(image, size_limit=size_limit, interpolation=interpolation)
+    # logger.info(f"Resized image shape_1_: {image.shape}")
+    
+    # logger.info(f"mask image shape_0_: {mask.shape} / {type(mask)}")
+    mask = resize_max_size(mask, size_limit=size_limit, interpolation=interpolation)
+    # logger.info(f"mask image shape_1_: {mask.shape} / {type(mask)}")
+
+    res_np_img = lama_cleaner_model(image, mask, config)
+    torch.cuda.empty_cache()
+  
+    image = Image.open(io.BytesIO(numpy_to_bytes(res_np_img, 'png')))
+    return  image
+
+def xywh_to_xyxy(box, sizeW, sizeH):
+    if isinstance(box, list):
+        box = torch.Tensor(box)
+    box = box * torch.Tensor([sizeW, sizeH, sizeW, sizeH])
+    box[:2] -= box[2:] / 2  # top left corner
+    box[2:] += box[:2]      # bottom right corner
+    box = box.numpy()
+    return box
+
+def to_extend_mask(segment_mask, boxes_filt, size, remove_mask_extend, remove_mode):
+    # remove from mask
+    mask_imgs = []
+    masks_shape = segment_mask.shape        
+    boxes_filt_ori_array = boxes_filt.numpy()
+    if inpaint_mode == 'merge':
+        extend_shape_0 = masks_shape[0]
+        extend_shape_1 = masks_shape[1]
+    else:
+        extend_shape_0 = 1
+        extend_shape_1 = 1
+    for i in range(extend_shape_0):
+        for j in range(extend_shape_1):                
+            mask = segment_mask[i][j].cpu().numpy()
+            mask_pil = Image.fromarray(mask)
+        
+            if remove_mode == 'segment':
+                useRectangle = False
+            else:
+                useRectangle = True
+
+            try:
+                remove_mask_extend = int(remove_mask_extend)
+            except:
+                remove_mask_extend = 10
+            mask_pil_exp = mask_extend(copy.deepcopy(mask_pil).convert("RGB"), 
+                            xywh_to_xyxy(torch.tensor(boxes_filt_ori_array[i]), size[0], size[1]),
+                            extend_pixels=remove_mask_extend, useRectangle=useRectangle)
+            mask_imgs.append(mask_pil_exp)
+    mask_pil = mix_masks(mask_imgs)
+    return mask_pil
+
 def run_anything_task(input_image, text_prompt, task_type, inpaint_prompt, box_threshold, text_threshold, 
             iou_threshold, inpaint_mode, mask_source_radio, remove_mode, remove_mask_extend):
 
@@ -199,6 +304,8 @@ def run_anything_task(input_image, text_prompt, task_type, inpaint_prompt, box_t
     # load image
     image_pil, image_tensor = load_image_and_transform(input_image['image'])
 
+    output_images = []
+    output_images.append(input_image['image'])
     # RUN GROUNDINGDINO: we skip DINO if we draw mask on the image
     if (task_type == 'inpainting' or task_type == 'remove') and mask_source_radio == mask_source_draw:
         pass
@@ -218,7 +325,6 @@ def run_anything_task(input_image, text_prompt, task_type, inpaint_prompt, box_t
             }
 
         # store and save DINO output
-        output_images = []
         image_with_box = plot_boxes_to_image(copy.deepcopy(image_pil), pred_dict)[0]
         image_path = os.path.join(output_dir, f"grounding_dino_output_{file_temp}.jpg")
         image_with_box.save(image_path)
@@ -298,9 +404,18 @@ def run_anything_task(input_image, text_prompt, task_type, inpaint_prompt, box_t
         if task_type == 'inpainting':
             # inpainting pipeline
             image_source_for_inpaint = image_pil.resize((512, 512))
+            if remove_mask_extend:
+                mask_pil = to_extend_mask(masks_ori, boxes_filt_ori, size, remove_mask_extend, remove_mode)
+                output_images.append(mask_pil.convert("RGB"))
             image_mask_for_inpaint = mask_pil.resize((512, 512))
             image_inpainting = sd_pipe(prompt=inpaint_prompt, image=image_source_for_inpaint, mask_image=image_mask_for_inpaint).images[0]            
-        # else: add remove option here!!
+        else:
+            # remove from mask
+            if mask_source_radio == mask_source_segment:
+                if remove_mask_extend:  
+                    mask_pil = to_extend_mask(masks_ori, boxes_filt_ori, size, remove_mask_extend, remove_mode)
+                output_images.append(mask_pil.convert("RGB"))               
+            image_inpainting = lama_cleaner_process(np.array(image_pil), np.array(mask_pil.convert("L")))
 
         image_inpainting = image_inpainting.resize((image_pil.size[0], image_pil.size[1]))
         output_images.append(image_inpainting)
@@ -330,6 +445,7 @@ def change_radio_display(task_type, mask_source_radio):
 # model initialization
 groundingDino_model = load_model_hf(config_file, ckpt_repo_id, ckpt_filename, groundingdino_device)
 sam_predictor = SamPredictor(build_sam(checkpoint=sam_checkpoint))
+lama_cleaner_model = ModelManager(name='lama',device='cpu')
 
 # initialize stable-diffusion-inpainting
 logger.info(f"initialize stable-diffusion-inpainting...")
@@ -359,7 +475,7 @@ if __name__ == "__main__":
         with gr.Row():
             with gr.Column():
                 input_image = gr.Image(
-                    source="upload", elem_id="image_upload", type="pil", tool="sketch", value="demo1.jpg", label="Upload")
+                    source="upload", elem_id="image_upload", type="pil", tool="sketch", value="inpaint_demo.jpg", label="Upload")
                 task_type = gr.Radio(["segment", "inpainting", "remove"],  value="segment", 
                                                 label='Task type', visible=True)
                 
@@ -368,7 +484,7 @@ if __name__ == "__main__":
                                     visible=False) 
                 
                 text_prompt = gr.Textbox(label="Detection Prompt, seperating each name with dot '.', i.e.: bear.cat.dog.chair ]", \
-                                         value='bear', placeholder="Cannot be empty")                                                
+                                         value='dog', placeholder="Cannot be empty")                                                
                 inpaint_prompt = gr.Textbox(label="Inpaint Prompt (if this is empty, then remove)", visible=False)
                 
                 run_button = gr.Button(label="Run")
@@ -387,7 +503,7 @@ if __name__ == "__main__":
                         with gr.Column(scale=1):
                             remove_mode = gr.Radio(["segment", "rectangle"],  value="segment", label='remove mode') 
                         with gr.Column(scale=1):
-                            remove_mask_extend = gr.Textbox(label="remove_mask_extend", value='10')
+                            remove_mask_extend = gr.Textbox(label="Enlarge Mask (Empty: no mask extension, default: 10)", value=10)
 
             with gr.Column():
                 gallery = gr.Gallery(label="result images", show_label=True, elem_id="gallery", visible=True
